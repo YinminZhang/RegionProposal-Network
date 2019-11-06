@@ -16,3 +16,5 @@ def iou(bbox_a, bbox_b):
         area_a = torch.prod(bbox_a[:, 2:] - bbox_a[:, :2], dim=1)
         area_b = torch.prod(bbox_b[:, 2:] - bbox_b[:, :2], dim=1)
         area_u = torch.clamp(area_a + area_b - area_i, min=1e-8)
+
+    return area_i / area_u
