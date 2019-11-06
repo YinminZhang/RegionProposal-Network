@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from proposal_creator import ProposalCreator
 from anchor_target_creator import AnchorTargetCreator
 
+
+# TODO overwrite Reigon proposal network
 class RPN(nn.Module):
     """ Reigon proposal network"""
     def __index__(self,
