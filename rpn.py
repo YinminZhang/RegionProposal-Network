@@ -1,6 +1,9 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from anchors import Anchors
 from proposal_creator import ProposalCreator
 from anchor_target_creator import AnchorTargetCreator
 
@@ -8,13 +11,9 @@ from anchor_target_creator import AnchorTargetCreator
 # TODO overwrite Reigon proposal network
 class RPN(nn.Module):
     """ Reigon proposal network"""
-    def __index__(self,
-                  in_channels,
-                  mid_channels,
-                  scales = [8, 16, 32],
-                  ratios = [0.5, 1, 2],
-                  stride = 16,
-                  ):
+    def __index__(self, in_channels, mid_channels,
+                  scales = [8, 16, 32], ratios = [0.5, 1, 2],
+                  stride = 16,):
         super(RPN, self).__init__()
 
         # intial hyper-parameters
@@ -23,21 +22,23 @@ class RPN(nn.Module):
         self.anchor_scales = scales
         self.anchor_ratios = ratios
         self.feat_stride = stride
-        self.n_anchor = len(self.anchor_ratios) * len(self.anchor_scales)
+        self.num_anchor = len(self.anchor_ratios) * len(self.anchor_scales)
+        self.anchor = Anchors(pyramid_levels=[4])
+
         # intial network
         self.conv1 = nn.Conv2d(in_channels, mid_channels, 3, 1, 1, 1)
         # softmax bg/fg
-        self.score_out = self.n_anchor * 2
+        self.score_out = self.num_anchor * 2
         self.cls_score = nn.Conv2d(mid_channels, self.score_out, 1, 1, 0)
         # box offset
-        self.bbox_out = self.n_anchor * 4
+        self.bbox_out = self.num_anchor * 4
         self.bbox_pred = nn.Conv2d(mid_channels, self.bbox_out, 1, 1, 0)
 
         # define proposal layer
-        self.RPN_proposal = ProposalCreator(self.feat_stride, self.anchor_scales, self.anchor_ratios)
+        self.proposal_layer = ProposalCreator(self.feat_stride, self.anchor_scales, self.anchor_ratios)
 
         # define anchor target layer
-        self.RPN_anchor_target = AnchorTargetCreator(self.feat_stride, self.anchor_scales, self.anchor_ratios)
+        self.anchor_target_layer = AnchorTargetCreator(self.feat_stride, self.anchor_scales, self.anchor_ratios)
 
         # intial network parameters
         _normal_init(self.conv1)
@@ -59,59 +60,38 @@ class RPN(nn.Module):
         )
         return feat
 
-    def forward(self, base_feature, im_info, gt_boxes, num_boxes):
+    def forward(self, feat, img_size, scale=1):
+        batch_size, channels, height, width = feat.shape
+        anchors = self.anchor(np.ones(size=(3, height * feat, width * height)))
 
-        batch_size = base_feature.shape[0]
+        num_anchors = anchors.shape[0] // (height * width)
 
-        # return feature map after conv + relu layer
-        rpn_conv1 = F.relu(self.conv1(base_feature), inplace=True)
+        conv = F.relu(self.conv1(feat))
 
-        # get rpn cls score
-        rpn_cls_score = self.cls_score(rpn_conv1)
-        rpn_cls_score_reshape = self.reshape(rpn_cls_score, 2)
-        rpn_cls_prob_reshape = F.softmax(rpn_cls_score_reshape, 1)
-        rpn_cls_prob = self.reshape(rpn_cls_prob_reshape, self.score_out)
+        # bbox predict branch
+        rpn_bbox = self.bbox_pred(conv)
+        rpn_bbox = rpn_bbox.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, 4)
 
-        # get rpn offset to the anchor boxes
-        rpn_bbox_pred = self.bbox_pred(rpn_conv1)
+        # classification prediction (background or foreground)
+        rpn_scores = self.cls_score(conv)
+        rpn_scores = rpn_scores.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, 2)
+        rpn_softmax_scores = F.softmax(rpn_scores, dim=2)
+        rpn_fg_scores = rpn_softmax_scores[:, 1].contiguous()
 
-        cfg_key = 'train' if self.training else 'test'
+        # create rois
+        rois = []
+        roi_indices = []
+        for i in range(batch_size):
+            roi = self.proposal_layer(rpn_bbox[i], rpn_scores,
+                                      anchors, img_size, scale=scale)
+            batch_index = i * torch.ones((len(roi),), dtype=torch.int32)
+            rois.append(roi)
+            roi_indices.append(batch_index)
 
-        rois = self.RPN_proposal((rpn_cls_prob.data, rpn_bbox_pred.data,
-                                  im_info, cfg_key))
+        rois = torch.stack(rois, dim=0)
+        roi_indices = torch(roi_indices, dim=0)
 
-        self.rpn_cls_loss = 0
-        self.rpn_box_loss = 0
-
-        # See https://github.com/jwyang/faster-rcnn.pytorch/blob/master/lib/model/rpn/anchor_target_layer.py for more details.
-        if self.training:
-
-            rpn_data = self.RPN_anchor_target((rpn_cls_score.data, gt_boxes, im_info, num_boxes))
-
-            # compute cls loss
-            rpn_cls_score = rpn_cls_score_reshape.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, 2)
-            rpn_label = rpn_data[0].view(batch_size, -1)
-
-            rpn_keep = torch.tensor(rpn_label.view(-1).ne(-1).nonzero().view(-1))
-            rpn_cls_score = torch.index_select(rpn_cls_score.view(-1, 2), 0, rpn_keep)
-            rpn_label = torch.index_select(rpn_label.view(-1), 0, rpn_keep.data)
-            rpn_label = torch.tensor(rpn_label.long())
-            self.rpn_loss_cls = F.cross_entropy(rpn_cls_score, rpn_label)
-            fg_cnt = torch.sum(rpn_label.data.ne(0))
-
-            rpn_bbox_targets, rpn_bbox_inside_weights, rpn_bbox_outside_weights = rpn_data[1:]
-
-            # compute bbox regression loss
-            rpn_bbox_inside_weights = torch.tensor(rpn_bbox_inside_weights)
-            rpn_bbox_outside_weights = torch.tensor(rpn_bbox_outside_weights)
-            rpn_bbox_targets = torch.tensor(rpn_bbox_targets)
-
-            self.rpn_loss_box = _smooth_l1_loss(rpn_bbox_pred, rpn_bbox_targets, rpn_bbox_inside_weights,
-                                                rpn_bbox_outside_weights, sigma=3, dim=[1, 2, 3])
-
-        return rois, self.rpn_loss_cls, self.rpn_loss_box
-
-
+        return rpn_bbox, rpn_scores, rois, roi_indices, anchors
 
 def _normal_init(m, mean=0, stddev=0.01, truncated=False):
     if truncated:
