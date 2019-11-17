@@ -1,10 +1,6 @@
 import torch
-import torch.nn as nn
-import numpy as np
-from losses import iou
-from anchors import Anchors
-from nms import gpu_nms
-from bbox import bbox2loc, loc2bbox
+from model.nms import gpu_nms
+from model.bbox import loc2bbox
 
 class ProposalCreator:
     def __init__(self, parent_model, nms_threshold=0.7,
@@ -39,14 +35,16 @@ class ProposalCreator:
         width = roi[:, 3] - roi[:, 1]
         keep = (height > min_size) & (width > min_size)
         roi = roi[keep, :]
-        score = score[keep]
+        score = score.squeeze(dim=0)[keep, 1]
 
-        if n_pre_nms > score.shape[0]:
-            order = score.sort(0, descending=True)
-            roi = roi[order[1][:, n_pre_nms], :]
+        if n_pre_nms > 0:
+            order = score.sort(0, descending=True)[1]
+            n_pre_nms = min(n_pre_nms, roi.shape[0])
+            roi = roi[order[:n_pre_nms], :]
+            score = score[order[:n_pre_nms]]
 
-        keep_index, _ = gpu_nms(torch.stack((roi, score), dim=1), self.nms_threshold)
-        keep_index = keep_index[:, n_post_nms]
+        keep_index, _ = gpu_nms(torch.cat((roi, score.unsqueeze(dim=1)), dim=1), self.nms_threshold)
+        keep_index = keep_index[:n_post_nms]
 
         roi = roi[keep_index, :]
 

@@ -1,10 +1,8 @@
 import torch
-import torch.nn as nn
 import numpy as np
-from losses import iou
-from anchors import Anchors
-from nms import gpu_nms
-from bbox import bbox2loc, loc2bbox
+from utils.losses import iou
+from model.bbox import bbox2loc
+
 
 class AnchorTargetCreator():
 
@@ -21,7 +19,7 @@ class AnchorTargetCreator():
 
         num_anchors = anchors.shape[0]
         anchors[:, 0] = torch.clamp_min(anchors[:, 0], 0)
-        anchors[:, 1] = torch.clamp_min(anchors[:, 1], 1)
+        anchors[:, 1] = torch.clamp_min(anchors[:, 1], 0)
         anchors[:, 2] = torch.clamp_max(anchors[:, 2], height)
         anchors[:, 3] = torch.clamp_max(anchors[:, 3], width)
 
@@ -40,19 +38,21 @@ class AnchorTargetCreator():
 
         # subsample positive labels if too many labels are positive
         num_positive = self.positive_ratio * num_anchors
-        positive_index = (targets == 1).nonzero().cpu().numpy()
+        positive_index = (targets == 1).nonzero().view(-1)
 
         if len(positive_index) > num_positive:
-            disable_index =  np.random.choice(positive_index, size=(len(positive_index) - num_positive), replace=False)
-            disable_index = torch.from_numpy(disable_index).cuda()
+            # disable_index =  np.random.choice(positive_index, size=(len(positive_index) - num_positive), replace=False)
+            # disable_index = torch.from_numpy(disable_index).cuda()
+            disable_index = torch.multinomial(positive_index.float(), num_samples=(positive_index.shape[0] - num_positive), replacement=False).long()
             targets[disable_index] = -1
 
         # subsample negative labels if too many labels are negative
         num_negative = self.n_sample - (targets == 1).sum()
-        neg_index = (targets == 0).nonzero().cpu().numpy()
+        neg_index = (targets == 0).nonzero().view(-1)
         if len(neg_index) > num_negative:
-            disable_index = np.random.choice(neg_index, size=(len(neg_index) - num_negative), replace=False)
-            disable_index = torch.from_numpy(disable_index).cuda()
+            # disable_index = np.random.choice(neg_index, size=(len(neg_index) - num_negative), replace=False)
+            # disable_index = torch.from_numpy(disable_index).cuda()
+            disable_index = torch.multinomial(neg_index.float(), num_samples=(neg_index.shape[0] - num_negative), replacement=False).long()
             targets[disable_index] = -1
 
         loc = bbox2loc(anchors, bbox[IoU_argmax])

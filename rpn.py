@@ -3,17 +3,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from anchors import Anchors
-from proposal_creator import ProposalCreator
-from anchor_target_creator import AnchorTargetCreator
+from model.anchors import Anchors
+from model.proposal_creator import ProposalCreator
+from model.anchor_target_creator import AnchorTargetCreator
 
 
 # TODO overwrite Reigon proposal network
 class RPN(nn.Module):
     """ Reigon proposal network"""
-    def __index__(self, in_channels, mid_channels,
-                  scales = [8, 16, 32], ratios = [0.5, 1, 2],
-                  stride = 16,):
+    def __init__(self, in_channels, mid_channels,
+                 scales = [8, 16, 32], ratios = [0.5, 1, 2],
+                 stride = 16,
+                 proposal_creator_params=dict()):
         super(RPN, self).__init__()
 
         # intial hyper-parameters
@@ -31,11 +32,11 @@ class RPN(nn.Module):
         self.score_out = self.num_anchor * 2
         self.cls_score = nn.Conv2d(mid_channels, self.score_out, 1, 1, 0)
         # box offset
-        self.bbox_out = self.num_anchor * 4
-        self.bbox_pred = nn.Conv2d(mid_channels, self.bbox_out, 1, 1, 0)
+        self.loc_out = self.num_anchor * 4
+        self.loc_pred = nn.Conv2d(mid_channels, self.loc_out, 1, 1, 0)
 
         # define proposal layer
-        self.proposal_layer = ProposalCreator(self.feat_stride, self.anchor_scales, self.anchor_ratios)
+        self.proposal_layer = ProposalCreator(self, **proposal_creator_params)
 
         # define anchor target layer
         self.anchor_target_layer = AnchorTargetCreator(self.feat_stride, self.anchor_scales, self.anchor_ratios)
@@ -43,7 +44,7 @@ class RPN(nn.Module):
         # intial network parameters
         _normal_init(self.conv1)
         _normal_init(self.cls_score)
-        _normal_init(self.bbox_pred)
+        _normal_init(self.loc_pred)
 
         # intial loss
         self.rpn_cls_loss = 0
@@ -62,15 +63,16 @@ class RPN(nn.Module):
 
     def forward(self, feat, img_size, scale=1):
         batch_size, channels, height, width = feat.shape
-        anchors = self.anchor(np.ones(size=(3, height * feat, width * height)))
+        anchors = self.anchor(np.ones(shape=(batch_size, 3, height * self.feat_stride,
+                                             width * self.feat_stride)))[0]
 
         num_anchors = anchors.shape[0] // (height * width)
 
         conv = F.relu(self.conv1(feat))
 
-        # bbox predict branch
-        rpn_bbox = self.bbox_pred(conv)
-        rpn_bbox = rpn_bbox.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, 4)
+        # location predict branch
+        rpn_loc = self.loc_pred(conv)
+        rpn_loc = rpn_loc.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, 4)
 
         # classification prediction (background or foreground)
         rpn_scores = self.cls_score(conv)
@@ -82,16 +84,16 @@ class RPN(nn.Module):
         rois = []
         roi_indices = []
         for i in range(batch_size):
-            roi = self.proposal_layer(rpn_bbox[i], rpn_scores,
+            roi = self.proposal_layer(rpn_loc[i], rpn_scores[i],
                                       anchors, img_size, scale=scale)
             batch_index = i * torch.ones((len(roi),), dtype=torch.int32)
             rois.append(roi)
             roi_indices.append(batch_index)
 
-        rois = torch.stack(rois, dim=0)
-        roi_indices = torch(roi_indices, dim=0)
+        rois = torch.cat(rois, dim=0)
+        roi_indices = torch.cat(roi_indices, dim=0)
 
-        return rpn_bbox, rpn_scores, rois, roi_indices, anchors
+        return rpn_loc, rpn_scores, rois, roi_indices, anchors
 
 def _normal_init(m, mean=0, stddev=0.01, truncated=False):
     if truncated:
